@@ -10,7 +10,7 @@ st.set_page_config(page_title="Lebanon Energy — Visual 2 & 4", page_icon="⚡"
 st.title("⚡ Lebanon Energy — Interactive Visuals (Visual 2 & Visual 4)")
 
 # -------------------------------- Config --------------------------------
-DATA_PATH = Path("325 data.csv")  # <- change this if your CSV has a different name
+DATA_PATH = Path("325 data.csv")  # change if your CSV has a different name
 
 # ---------------- Helpers ----------------
 def load_csv_local(path: Path) -> pd.DataFrame | None:
@@ -22,6 +22,22 @@ def coerce_bool(s: pd.Series) -> pd.Series:
     s_num = pd.to_numeric(s, errors="coerce")
     if s_num.notna().any(): return (s_num.fillna(0) != 0)
     return s.astype(str).str.strip().str.lower().isin({"yes","y","true","t","1"})
+
+def coerce_percent(s: pd.Series) -> pd.Series:
+    """
+    Accepts 0–1, 0–100, or '37%' strings and returns a numeric 0–100 scale.
+    """
+    if pd.api.types.is_numeric_dtype(s):
+        s = s.astype(float)
+        # if majority are 0..1, scale to percent
+        if s.dropna().between(0, 1).mean() > 0.5:
+            return s * 100.0
+        return s
+    s_clean = s.astype(str).str.strip().str.replace('%', '', regex=False)
+    s_num = pd.to_numeric(s_clean, errors='coerce')
+    if s_num.dropna().between(0, 1).mean() > 0.5:
+        return s_num * 100.0
+    return s_num
 
 def clean_town_name(series: pd.Series) -> pd.Series:
     s = series.astype(str)
@@ -40,7 +56,7 @@ def derive_onehot_label(row: pd.Series, mapping: dict, default="Unknown"):
             return label
     return default
 
-# ---------------- Load data (local only; no uploader) ----------------
+# ---------------- Load data (local only) ----------------
 df = load_csv_local(DATA_PATH)
 if df is None:
     st.error(f"Could not find **{DATA_PATH}**. Place your CSV next to `app.py` (or update `DATA_PATH`).")
@@ -69,9 +85,11 @@ else:
 # ---------------- Column constants ----------------
 COL_EXISTS_YES = "Existence of alternative energy - exists"
 COL_EXISTS_NO  = "Existence of alternative energy - does not exist"
+
 COL_GRID_GOOD  = "State of the power grid - good"
 COL_GRID_OK    = "State of the power grid - acceptable"
 COL_GRID_BAD   = "State of the power grid - bad"
+
 COL_LIGHT_GOOD = "State of the lighting network - good"
 COL_LIGHT_OK   = "State of the lighting network - acceptable"
 COL_LIGHT_BAD  = "State of the lighting network - bad"
@@ -85,7 +103,7 @@ ENERGY_COLS = [c for c in [
 
 # Guardrails
 for req in [
-    COL_GOV, COL_EXISTS_YES, COL_EXISTS_NO,
+    COL_GOV,
     COL_GRID_GOOD, COL_GRID_OK, COL_GRID_BAD,
     COL_LIGHT_GOOD, COL_LIGHT_OK, COL_LIGHT_BAD
 ]:
@@ -96,21 +114,43 @@ if not ENERGY_COLS:
     st.error("No energy-type columns found.")
     st.stop()
 
-# ---------------- Derivations ----------------
-exists_yes = coerce_bool(df[COL_EXISTS_YES])
-exists_no  = coerce_bool(df[COL_EXISTS_NO])
-df["_adoption_pct"] = np.where(exists_yes, 100.0, np.where(exists_no, 0.0, np.nan))
+# ---------------- Adoption % (real range if present; else fallback 0/100) ----------------
+# Try to find a numeric adoption column
+ADOPTION_CANDIDATES = [
+    "adoption_rate", "adoption_pct", "adoption percent", "alt_energy_adoption",
+    "alternative energy adoption", "adoption"
+]
+adopt_col = next((c for c in df.columns if c.lower() in ADOPTION_CANDIDATES), None)
+
+if adopt_col is not None:
+    df["_adoption_pct"] = coerce_percent(df[adopt_col]).clip(lower=0, upper=100)
+else:
+    # fallback from exists/does-not-exist flags
+    if (COL_EXISTS_YES in df.columns) and (COL_EXISTS_NO in df.columns):
+        exists_yes = coerce_bool(df[COL_EXISTS_YES])
+        exists_no  = coerce_bool(df[COL_EXISTS_NO])
+        df["_adoption_pct"] = np.where(exists_yes, 100.0, np.where(exists_no, 0.0, np.nan))
+    else:
+        # if nothing available, default to NaN and warn
+        df["_adoption_pct"] = np.nan
+        st.warning("No explicit adoption column found and existence flags missing; adoption filter will be disabled.")
+
+# Grid & lighting labels from one-hot flags
 df["_grid_label"] = df.apply(
-    lambda r: derive_onehot_label(r, {"Good": COL_GRID_GOOD, "Acceptable": COL_GRID_OK, "Bad": COL_GRID_BAD}), axis=1
+    lambda r: derive_onehot_label(r, {"Good": COL_GRID_GOOD, "Acceptable": COL_GRID_OK, "Bad": COL_GRID_BAD}),
+    axis=1
 )
 df["_light_label"] = df.apply(
-    lambda r: derive_onehot_label(r, {"Good": COL_LIGHT_GOOD, "Acceptable": COL_LIGHT_OK, "Bad": COL_LIGHT_BAD}), axis=1
+    lambda r: derive_onehot_label(r, {"Good": COL_LIGHT_GOOD, "Acceptable": COL_LIGHT_OK, "Bad": COL_LIGHT_BAD}),
+    axis=1
 )
 
-# ---------------- Sidebar filters (with search) ----------------
+# ---------------- Sidebar filters (with search + adoption range) ----------------
 govs_all = sorted(df[COL_GOV].dropna().astype(str).unique().tolist())
 with st.sidebar:
     st.header("🔎 Filters")
+
+    # Governorate search + multiselect
     gov_search = st.text_input("Search governorate", placeholder="type to filter…").strip().lower()
     if gov_search:
         gov_options = [g for g in govs_all if gov_search in g.lower()]
@@ -121,32 +161,61 @@ with st.sidebar:
         gov_options = govs_all
     sel_govs = st.multiselect("Filter by governorate", options=gov_options, default=gov_options)
     if not sel_govs:
-        sel_govs = gov_options  # ensure at least something selected
+        sel_govs = gov_options
 
-    min_adopt = st.slider("Minimum adoption rate (%)", 0, 100, 0, 1)
+    # Adoption range slider (dynamic to your data; max out to 100 if data smaller)
+    if df["_adoption_pct"].notna().any():
+        data_min = float(np.nanmin(df["_adoption_pct"]))
+        data_max = float(np.nanmax(df["_adoption_pct"]))
+        slider_max = max(100.0, round(data_max + 0.5, 1))  # keep headroom
+        adopt_range = st.slider(
+            "Adoption rate filter (%)",
+            min_value=0.0, max_value=slider_max,
+            value=(0.0, min(slider_max, round(data_max, 1))),
+            step=0.5,
+            help="Only include towns whose adoption falls in this range."
+        )
+    else:
+        adopt_range = (0.0, 100.0)
+        st.caption("Adoption filter disabled (no adoption data).")
 
     st.markdown("---")
     st.subheader("🔥 Visual 4 Options")
     norm_axis = st.radio("Normalize heatmap by", ["None", "Grid state", "Lighting state"], horizontal=True)
 
-mask = df[COL_GOV].astype(str).isin(sel_govs) & (df["_adoption_pct"].fillna(-1) >= min_adopt)
+# Build mask
+mask_gov = df[COL_GOV].astype(str).isin(sel_govs)
+if df["_adoption_pct"].notna().any():
+    mask_adopt = df["_adoption_pct"].between(adopt_range[0], adopt_range[1], inclusive="both").fillna(False)
+else:
+    mask_adopt = True  # no adoption filter available
+mask = mask_gov & mask_adopt
 df_filt = df.loc[mask].copy()
 
+# Show current adoption range (optional context)
+if df["_adoption_pct"].notna().any():
+    st.caption(f"Filtering towns with adoption between **{adopt_range[0]}%** and **{adopt_range[1]}%**.")
+
+# Tabs
 tab2, tab4 = st.tabs(["📊 Visual 2 — Stacked Bar by Governorate", "🧯 Visual 4 — Heatmap: Grid × Lighting"])
 
 # ---------------- Visual 2 (Percent-only stacked) ----------------
 with tab2:
     st.subheader("Visual 2 — Alternative Energy by Governorate (Share within governorate)")
+
     long_frames = []
     for c in ENERGY_COLS:
         flag = coerce_bool(df_filt[c])
+
+        # towns sample per gov × energy type
         towns = (
             df_filt.loc[flag, [COL_GOV, "_town_clean"]]
             .groupby(COL_GOV, dropna=False)["_town_clean"]
-            .agg(lambda s: list(s[:12]))  # sample towns for tooltip
+            .agg(lambda s: list(s[:12]))
             .reset_index()
             .rename(columns={"_town_clean": "Towns (sample)"})
         )
+
         counts = (
             df_filt.assign(_flag=flag)
                   .groupby(COL_GOV, dropna=False)["_flag"]
@@ -154,6 +223,7 @@ with tab2:
                   .rename("Count")
                   .reset_index()
         )
+
         merged = counts.merge(towns, on=COL_GOV, how="left")
         merged["Energy Type"] = c.replace("Type of alternative energy used - ", "").title()
         merged["Towns (sample)"] = merged["Towns (sample)"].apply(
@@ -189,6 +259,7 @@ with tab2:
 with tab4:
     st.subheader("Visual 4 — Heatmap: Grid State × Lighting State")
     st.caption("Cells show the number of towns (or share) for each Grid × Lighting combination.")
+
     grp = df_filt.groupby(["_grid_label", "_light_label"], dropna=False).size().reset_index(name="Count")
     towns = (
         df_filt.groupby(["_grid_label", "_light_label"], dropna=False)["_town_clean"]
