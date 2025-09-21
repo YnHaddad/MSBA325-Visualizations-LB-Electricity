@@ -1,342 +1,297 @@
 # app.py
-import streamlit as st
+# Streamlit app showing ONLY:
+# 2) (Interactive) Lighting network state by governorate
+# 4) (Interactive) Town-level alternative energy profile + compare
+#
+# It also cleans Town names that come as links (URIs) into readable names.
+
+import os
+import re
 import pandas as pd
 import numpy as np
+import streamlit as st
 import altair as alt
-from pathlib import Path
-from urllib.parse import unquote
 
-st.set_page_config(page_title="Lebanon Energy — Visual 2 & 4", page_icon="⚡", layout="wide")
-st.title("⚡ Lebanon Energy — Interactive Visuals (Visual 2 & Visual 4)")
+# ----------------------------
+# Config
+# ----------------------------
+st.set_page_config(
+    page_title="Municipal Energy Explorer — Visuals 2 & 4",
+    layout="wide",
+    page_icon="🔌",
+)
 
-# -------------------------------- Config --------------------------------
-DATA_PATH = Path("325 data.csv")  # change if your CSV has a different name
+DATA_PATH_GUESS = "325 data.csv"
 
-# ---------------- Helpers ----------------
-def load_csv_local(path: Path) -> pd.DataFrame | None:
-    return pd.read_csv(path) if path.exists() else None
-
-def coerce_bool(s: pd.Series) -> pd.Series:
-    if s is None: return pd.Series([False] * 0, dtype=bool)
-    if pd.api.types.is_bool_dtype(s): return s.fillna(False)
-    s_num = pd.to_numeric(s, errors="coerce")
-    if s_num.notna().any(): return (s_num.fillna(0) != 0)
-    return s.astype(str).str.strip().str.lower().isin({"yes","y","true","t","1"})
-
-def coerce_percent(s: pd.Series) -> pd.Series:
+# ----------------------------
+# Helpers
+# ----------------------------
+def extract_name_from_link(val: str) -> str:
     """
-    Accepts 0–1, 0–100, or '37%' strings and returns a numeric 0–100 scale.
+    If the value looks like a URL/DBpedia URI, extract the last path segment,
+    replace underscores with spaces, strip trailing punctuation/fragments.
+    Otherwise, return the original string, trimmed.
     """
-    if pd.api.types.is_numeric_dtype(s):
-        s = s.astype(float)
-        if s.dropna().between(0, 1).mean() > 0.5:
-            return s * 100.0
-        return s
-    s_clean = s.astype(str).str.strip().str.replace('%', '', regex=False)
-    s_num = pd.to_numeric(s_clean, errors='coerce')
-    if s_num.dropna().between(0, 1).mean() > 0.5:
-        return s_num * 100.0
-    return s_num
+    if pd.isna(val):
+        return val
+    s = str(val).strip()
+    if s.startswith(("http://", "https://")):
+        # Take last path segment
+        m = re.search(r"/([^/?#]+)", s[::-1])  # reverse trick to catch from end
+        if m:
+            seg = m.group(1)[::-1]  # reverse back
+        else:
+            # Fallback: last chunk after last slash
+            seg = s.rsplit("/", 1)[-1]
+        seg = seg.replace("_", " ")
+        # Remove common DBpedia suffixes like "(district)" if present at end of segment
+        seg = re.sub(r"\s*\((?:[^)]*)\)\s*$", "", seg).strip()
+        return seg
+    # Handle dbpedia-style without protocol
+    if "dbpedia.org" in s:
+        seg = s.rsplit("/", 1)[-1].replace("_", " ")
+        seg = re.sub(r"\s*\((?:[^)]*)\)\s*$", "", seg).strip()
+        return seg
+    return s
 
-def clean_town_name(series: pd.Series) -> pd.Series:
-    s = series.astype(str)
-    tail = s.str.replace(r'/*[?#].*$', '', regex=True).str.replace(r'/*$', '', regex=True)
-    tail = tail.str.extract(r'([^/]+)$')[0].fillna(s)
-    tail = tail.map(lambda x: unquote(x) if isinstance(x, str) else x)
-    return (tail
-            .str.replace('_',' ',regex=False)
-            .str.replace('-',' ',regex=False)
-            .str.replace(r'\s+',' ',regex=True)
-            .str.strip())
+@st.cache_data(show_spinner=False)
+def load_data(uploaded_file=None):
+    if uploaded_file is not None:
+        df = pd.read_csv(uploaded_file)
+    else:
+        if not os.path.exists(DATA_PATH_GUESS):
+            st.error("CSV not found. Upload it from the sidebar or place '325 data.csv' next to app.py.")
+            st.stop()
+        df = pd.read_csv(DATA_PATH_GUESS)
 
-def derive_onehot_label(row: pd.Series, mapping: dict, default="Unknown"):
-    for label, col in mapping.items():
-        if col and col in row and pd.notna(row[col]) and coerce_bool(pd.Series([row[col]])).iloc[0]:
-            return label
-    return default
+    # Tidy columns
+    df.columns = [c.strip() for c in df.columns]
 
-# ---------------- Load data ----------------
-df = load_csv_local(DATA_PATH)
-if df is None:
-    st.error(f"Could not find **{DATA_PATH}**. Place your CSV next to `app.py` (or update `DATA_PATH`).")
-    st.stop()
-df = df.copy()
-
-# ---------------- Cleaned town + governorate ----------------
-if "Town_clean" in df.columns:
-    df["_town_clean"] = df["Town_clean"].astype(str)
-elif "Town" in df.columns:
-    df["_town_clean"] = clean_town_name(df["Town"])
-elif "Observation URI" in df.columns:
-    df["_town_clean"] = clean_town_name(df["Observation URI"])
-else:
-    guess_col = next((c for c in df.columns if "town" in c.lower() or "uri" in c.lower()), df.columns[0])
-    df["_town_clean"] = clean_town_name(df[guess_col])
-
-if "refArea_clean" in df.columns:
-    COL_GOV = "refArea_clean"
-elif "refArea" in df.columns:
-    df["_gov_clean"] = clean_town_name(df["refArea"])
-    COL_GOV = "_gov_clean"
-else:
-    COL_GOV = df.columns[0]
-
-# ---------------- Column constants ----------------
-COL_EXISTS_YES = "Existence of alternative energy - exists"
-COL_EXISTS_NO  = "Existence of alternative energy - does not exist"
-
-COL_GRID_GOOD  = "State of the power grid - good"
-COL_GRID_OK    = "State of the power grid - acceptable"
-COL_GRID_BAD   = "State of the power grid - bad"
-
-COL_LIGHT_GOOD = "State of the lighting network - good"
-COL_LIGHT_OK   = "State of the lighting network - acceptable"
-COL_LIGHT_BAD  = "State of the lighting network - bad"
-
-ENERGY_COLS = [c for c in [
-    "Type of alternative energy used - solar energy",
-    "Type of alternative energy used - wind energy",
-    "Type of alternative energy used - hydropower (water use)",
-    "Type of alternative energy used - other",
-] if c in df.columns]
-
-# Guardrails
-for req in [
-    COL_GOV,
-    COL_GRID_GOOD, COL_GRID_OK, COL_GRID_BAD,
-    COL_LIGHT_GOOD, COL_LIGHT_OK, COL_LIGHT_BAD
-]:
-    if req not in df.columns:
-        st.error(f"Missing required column: **{req}**")
+    # Clean Town names from links → readable names
+    town_col_guess = None
+    for cand in ["Town", "town", "Municipality", "municipality"]:
+        if cand in df.columns:
+            town_col_guess = cand
+            break
+    if town_col_guess is None:
+        st.error("Could not find a 'Town' column. Please ensure your CSV has a Town/municipality column.")
         st.stop()
-if not ENERGY_COLS:
-    st.error("No energy-type columns found.")
-    st.stop()
 
-# ---------------- Adoption % (detect real column; else fallback) ----------------
-name_hits = [c for c in df.columns if ("adopt" in c.lower()) or c.strip().endswith("%")]
-range_hits = [c for c in df.columns
-              if pd.api.types.is_numeric_dtype(df[c])
-              and df[c].dropna().between(0, 100).mean() > 0.95
-              and df[c].nunique(dropna=True) >= 3]
-candidates = list(dict.fromkeys(name_hits + range_hits))
-adopt_choice = st.sidebar.selectbox(
-    "Adoption column",
-    options=["<Use existence flags (0/100)>"] + candidates,
-    index=(0 if not candidates else 1),
-    help="Pick your numeric adoption column if you have one."
-)
+    df[town_col_guess] = df[town_col_guess].apply(extract_name_from_link)
 
-if adopt_choice != "<Use existence flags (0/100)>":
-    df["_adoption_pct"] = coerce_percent(df[adopt_choice]).clip(lower=0, upper=100)
-else:
-    if (COL_EXISTS_YES in df.columns) and (COL_EXISTS_NO in df.columns):
-        exists_yes = coerce_bool(df[COL_EXISTS_YES])
-        exists_no  = coerce_bool(df[COL_EXISTS_NO])
-        df["_adoption_pct"] = np.where(exists_yes, 100.0, np.where(exists_no, 0.0, np.nan))
-    else:
-        df["_adoption_pct"] = np.nan
-        st.warning("No adoption column selected and existence flags missing; adoption filter will be disabled.")
+    # Extract Governorate from refArea URI if present
+    if "refArea" in df.columns:
+        def extract_gov(x: str):
+            if pd.isna(x):
+                return np.nan
+            m = re.search(r'/([^/]+)$', str(x))
+            if m:
+                name = m.group(1).replace("_", " ")
+                name = name.replace("Governorate", "").strip()
+                name = re.sub(r"\s*\((?:[^)]*)\)\s*$", "", name).strip()
+                return name
+            return np.nan
+        df["Governorate"] = df["refArea"].apply(extract_gov)
+    elif "Governorate" not in df.columns:
+        df["Governorate"] = np.nan  # keep column for grouping
 
-# Grid & lighting labels
-df["_grid_label"] = df.apply(
-    lambda r: derive_onehot_label(r, {"Good": COL_GRID_GOOD, "Acceptable": COL_GRID_OK, "Bad": COL_GRID_BAD}),
-    axis=1
-)
-df["_light_label"] = df.apply(
-    lambda r: derive_onehot_label(r, {"Good": COL_LIGHT_GOOD, "Acceptable": COL_LIGHT_OK, "Bad": COL_LIGHT_BAD}),
-    axis=1
-)
+    # Canonical column keys (update these if your header names differ)
+    COLS = {
+        "town": town_col_guess,
+        "light_good": "State of the lighting network - good",
+        "light_ok": "State of the lighting network - acceptable",
+        "light_bad": "State of the lighting network - bad",
+        "alt_exists": "Existence of alternative energy - exists",
+        "alt_not": "Existence of alternative energy - does not exist",
+        "solar": "Type of alternative energy used - solar energy",
+        "wind": "Type of alternative energy used - wind energy",
+        "hydro": "Type of alternative energy used - hydropower (water use)",
+        "other": "Type of alternative energy used - other",
+    }
 
-# ---------------- Sidebar filters (search + adoption range + toggles) ----------------
-govs_all = sorted(df[COL_GOV].dropna().astype(str).unique().tolist())
-with st.sidebar:
-    st.header("🔎 Filters")
+    # Ensure missing columns exist as zeros (prevents crashes if a column is absent)
+    needed = [
+        COLS["light_good"], COLS["light_ok"], COLS["light_bad"],
+        COLS["alt_exists"], COLS["alt_not"],
+        COLS["solar"], COLS["wind"], COLS["hydro"], COLS["other"],
+    ]
+    for c in needed:
+        if c not in df.columns:
+            df[c] = 0
 
-    gov_search = st.text_input("Search governorate", placeholder="type to filter…").strip().lower()
-    if gov_search:
-        gov_options = [g for g in govs_all if gov_search in g.lower()]
-        if not gov_options:
-            st.caption("No matches — showing all.")
-            gov_options = govs_all
-    else:
-        gov_options = govs_all
-    sel_govs = st.multiselect("Filter by governorate", options=gov_options, default=gov_options)
-    if not sel_govs:
-        sel_govs = gov_options
+    # Force binary ints
+    for c in needed:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
 
-    # Adoption range (based on chosen column / fallback)
-    if df["_adoption_pct"].notna().any():
-        data_min = float(np.nanmin(df["_adoption_pct"]))
-        data_max = float(np.nanmax(df["_adoption_pct"]))
-        slider_max = max(100.0, round(data_max + 0.5, 1))
-        adopt_range = st.slider(
-            "Adoption rate filter (%)",
-            min_value=0.0, max_value=slider_max,
-            value=(0.0, min(slider_max, round(data_max, 1))),
-            step=0.5
-        )
-    else:
-        adopt_range = (0.0, 100.0)
-        st.caption("Adoption filter disabled (no adoption data).")
+    return df, COLS
 
-    # Bring back Counts vs Percent for Visual 2
-    st.markdown("---")
-    st.subheader("📊 Visual 2 Options")
-    stack_mode = st.radio("Y-axis mode", ["Counts", "Percent"], horizontal=True)
-    town_sample_max = st.slider("Towns listed in tooltip (per segment)", 0, 50, 12)
+# ----------------------------
+# Sidebar: data source
+# ----------------------------
+st.sidebar.header("Data")
+uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
+df, COLS = load_data(uploaded)
 
-    st.markdown("---")
-    st.subheader("🔥 Visual 4 Options")
-    norm_axis = st.radio("Normalize heatmap by", ["None", "Grid state", "Lighting state"], horizontal=True)
+st.title("🔌 Municipal Energy Explorer")
+st.caption("Showing only Visual 2 & Visual 4, with town names cleaned from links.")
 
-# Filter rows
-mask_gov = df[COL_GOV].astype(str).isin(sel_govs)
-if df["_adoption_pct"].notna().any():
-    mask_adopt = df["_adoption_pct"].between(adopt_range[0], adopt_range[1], inclusive="both").fillna(False)
-else:
-    mask_adopt = True
-mask = mask_gov & mask_adopt
-df_filt = df.loc[mask].copy()
+# ======================================================
+# VISUAL 2 — Lighting Network State by Governorate (Interactive)
+# ======================================================
+st.markdown("### 2) Lighting Network State — by Governorate")
 
-# Context caption
-if df["_adoption_pct"].notna().any():
-    st.caption(
-        f"Using **{adopt_choice if adopt_choice != '<Use existence flags (0/100)>' else 'existence flags'}**, "
-        f"showing adoption **{adopt_range[0]}–{adopt_range[1]}%**."
+left, right = st.columns([2, 1])
+with left:
+    govs_all = ["(All)"] + sorted([g for g in df["Governorate"].dropna().unique().tolist()])
+    chosen_gov = st.selectbox("Filter by Governorate", options=govs_all, index=0)
+with right:
+    normalize = st.checkbox("Show as % of towns", value=True)
+
+light_cols = [COLS["light_good"], COLS["light_ok"], COLS["light_bad"]]
+renamer = {
+    COLS["light_good"]: "Good",
+    COLS["light_ok"]: "Acceptable",
+    COLS["light_bad"]: "Bad",
+}
+
+df2 = df.copy()
+if chosen_gov != "(All)":
+    df2 = df2[df2["Governorate"] == chosen_gov]
+
+if chosen_gov == "(All)":
+    grp = (
+        df2.groupby("Governorate", dropna=False)[light_cols]
+        .sum()
+        .reset_index()
+        .rename(columns=renamer)
     )
-
-# Tabs
-tab2, tab4 = st.tabs(["📊 Visual 2 — Stacked Bar by Governorate", "🧯 Visual 4 — Heatmap: Grid × Lighting"])
-
-# ---------------- Visual 2 (Counts or Percent) ----------------
-with tab2:
-    st.subheader("Visual 2 — Alternative Energy by Governorate")
-
-    # Build long-form with per-segment count, mean adoption, and town samples with adoption %
-    long_frames = []
-    for c in ENERGY_COLS:
-        flag = coerce_bool(df_filt[c])
-
-        seg = df_filt.loc[flag, [COL_GOV, "_town_clean", "_adoption_pct"]].copy()
-        # Prepare sample of "Town (12.3%)"
-        seg["_town_label"] = seg.apply(
-            lambda r: f"{r['_town_clean']} ({r['_adoption_pct']:.1f}%)" if pd.notna(r["_adoption_pct"]) else f"{r['_town_clean']}",
-            axis=1
-        )
-
-        # aggregate
-        towns = (
-            seg.groupby(COL_GOV, dropna=False)["_town_label"]
-               .agg(lambda s: ", ".join(list(s[:town_sample_max])) if len(s) else "—")
-               .reset_index()
-               .rename(columns={"_town_label": "Towns (sample + adoption)"})
-        )
-        counts = (
-            seg.groupby(COL_GOV, dropna=False)["_town_clean"]
-               .size()
-               .reset_index(name="Count")
-        )
-        means = (
-            seg.groupby(COL_GOV, dropna=False)["_adoption_pct"]
-               .mean()
-               .reset_index(name="Mean adoption (%)")
-        )
-
-        merged = counts.merge(means, on=COL_GOV, how="left").merge(towns, on=COL_GOV, how="left")
-        merged["Energy Type"] = c.replace("Type of alternative energy used - ", "").title()
-        long_frames.append(merged)
-
-    long_df = pd.concat(long_frames, ignore_index=True)
-    long_df["Mean adoption (%)"] = long_df["Mean adoption (%)"].round(1)
-
-    # Order x by total Count descending (Counts mode) or by total share (Percent is normalized anyway)
-    totals = long_df.groupby(COL_GOV)["Count"].sum().sort_values(ascending=False).index.tolist()
-
-    if stack_mode == "Percent":
-        y_enc = alt.Y("Count:Q", stack="normalize", title="Share of towns (%)")
+    tall = grp.melt(id_vars=["Governorate"], var_name="State", value_name="count")
+    if normalize:
+        totals = tall.groupby("Governorate")["count"].transform("sum")
+        tall["pct"] = np.where(totals > 0, tall["count"] / totals, 0.0)
+        y = alt.Y("pct:Q", axis=alt.Axis(format="%"), title="Share of towns")
     else:
-        y_enc = alt.Y("Count:Q", stack=None, title="Number of towns")
+        y = alt.Y("count:Q", title="Number of towns")
 
-    chart_v2 = (
-        alt.Chart(long_df)
+    chart2 = (
+        alt.Chart(tall)
         .mark_bar()
         .encode(
-            x=alt.X(f"{COL_GOV}:N", sort=totals, title="Governorate"),
-            y=y_enc,
-            color=alt.Color("Energy Type:N", legend=alt.Legend(title="Energy Type")),
-            order=alt.Order("Energy Type:N"),
-            tooltip=[
-                alt.Tooltip(f"{COL_GOV}:N", title="Governorate"),
-                alt.Tooltip("Energy Type:N"),
-                alt.Tooltip("Count:Q"),
-                alt.Tooltip("Mean adoption (%):Q", title="Mean adoption (%)", format=".1f"),
-                alt.Tooltip("Towns (sample + adoption):N", title="Sample towns"),
-            ],
-        )
-        .properties(height=430)
-        .interactive()
-    )
-    selection = alt.selection_point(fields=["Energy Type"], bind="legend")
-    st.altair_chart(chart_v2.add_params(selection).transform_filter(selection), use_container_width=True)
-
-# ---------------- Visual 4 (Heatmap) ----------------
-with tab4:
-    st.subheader("Visual 4 — Heatmap: Grid State × Lighting State")
-    st.caption("Cells show the number of towns (or share) for each Grid × Lighting combination.")
-
-    grp = df_filt.groupby(["_grid_label", "_light_label"], dropna=False).size().reset_index(name="Count")
-    towns = (
-        df_filt.groupby(["_grid_label", "_light_label"], dropna=False)["_town_clean"]
-        .apply(lambda s: ", ".join(list(s[:15])) if len(s) else "—")
-        .reset_index(name="Towns (sample)")
-    )
-    heat = grp.merge(towns, on=["_grid_label", "_light_label"], how="left")
-
-    if norm_axis == "Grid state":
-        totals_h = heat.groupby("_grid_label")["Count"].transform("sum").replace(0, np.nan)
-        heat["Value"] = (heat["Count"] / totals_h) * 100
-        value_title = "Share within grid state (%)"
-        color_field = alt.Color("Value:Q", title=value_title, scale=alt.Scale(scheme="blues"))
-        tooltip_val = alt.Tooltip("Value:Q", title=value_title, format=".1f")
-    elif norm_axis == "Lighting state":
-        totals_h = heat.groupby("_light_label")["Count"].transform("sum").replace(0, np.nan)
-        heat["Value"] = (heat["Count"] / totals_h) * 100
-        value_title = "Share within lighting state (%)"
-        color_field = alt.Color("Value:Q", title=value_title, scale=alt.Scale(scheme="blues"))
-        tooltip_val = alt.Tooltip("Value:Q", title=value_title, format=".1f")
-    else:
-        heat["Value"] = heat["Count"]
-        color_field = alt.Color("Value:Q", title="Towns", scale=alt.Scale(scheme="blues"))
-        tooltip_val = alt.Tooltip("Value:Q", title="Towns", format=",.0f")
-
-    x_order = ["Bad", "Acceptable", "Good", "Unknown"]
-    y_order = ["Bad", "Acceptable", "Good", "Unknown"]
-
-    chart = (
-        alt.Chart(heat)
-        .mark_rect()
-        .encode(
-            x=alt.X("_grid_label:N", sort=x_order, title="Grid state"),
-            y=alt.Y("_light_label:N", sort=y_order, title="Lighting state"),
-            color=color_field,
-            tooltip=[
-                alt.Tooltip("_grid_label:N", title="Grid"),
-                alt.Tooltip("_light_label:N", title="Lighting"),
-                alt.Tooltip("Count:Q", title="Towns", format=",.0f"),
-                tooltip_val,
-                alt.Tooltip("Towns (sample):N", title="Sample towns"),
-            ],
+            x=alt.X("Governorate:N", sort="-y"),
+            y=y,
+            color=alt.Color("State:N"),
+            tooltip=["Governorate:N", "State:N", "count:Q"] + (["pct:Q"] if normalize else []),
         )
         .properties(height=420)
     )
-    labels = (
-        alt.Chart(heat)
-        .mark_text(fontWeight="bold")
+else:
+    counts = {
+        "Good": int(df2[COLS["light_good"]].sum()),
+        "Acceptable": int(df2[COLS["light_ok"]].sum()),
+        "Bad": int(df2[COLS["light_bad"]].sum()),
+    }
+    tall = pd.DataFrame({"State": list(counts.keys()), "count": list(counts.values())})
+    if normalize:
+        total = tall["count"].sum()
+        tall["pct"] = (tall["count"] / total) if total else 0.0
+        y = alt.Y("pct:Q", axis=alt.Axis(format="%"), title="Share of towns")
+    else:
+        y = alt.Y("count:Q", title="Number of towns")
+
+    chart2 = (
+        alt.Chart(tall)
+        .mark_bar()
         .encode(
-            x=alt.X("_grid_label:N", sort=x_order),
-            y=alt.Y("_light_label:N", sort=y_order),
-            text=alt.Text("Value:Q", format=".0f"),
+            x=alt.X("State:N", sort="-y"),
+            y=y,
+            color=alt.Color("State:N"),
+            tooltip=["State:N", "count:Q"] + (["pct:Q"] if normalize else []),
         )
+        .properties(height=360)
     )
-    st.altair_chart((chart + labels).interactive(), use_container_width=True)
+
+st.altair_chart(chart2, use_container_width=True)
+st.divider()
+
+# ======================================================
+# VISUAL 4 — Town-level Alternative Energy Profile (Interactive)
+# ======================================================
+st.markdown("### 4) Town Alternative Energy Profile")
+
+energy_map = {
+    "Solar": COLS["solar"],
+    "Wind": COLS["wind"],
+    "Hydro": COLS["hydro"],
+    "Other": COLS["other"],
+}
+
+towns = sorted(df[COLS["town"]].dropna().unique().tolist())
+
+c1, c2, c3 = st.columns([2, 2, 2])
+with c1:
+    selected_town = st.selectbox("Choose a town", options=towns)
+with c2:
+    compare_town = st.selectbox("Compare with (optional)", options=["(None)"] + towns, index=0)
+with c3:
+    types_chosen = st.multiselect(
+        "Energy types to display",
+        options=list(energy_map.keys()),
+        default=list(energy_map.keys()),
+    )
+
+def build_town_profile(frame, town_name, label):
+    row = frame[frame[COLS["town"]] == town_name].head(1)
+    if row.empty:
+        return pd.DataFrame(columns=["Town", "Type", "Present"])
+    records = []
+    for t_label, colname in energy_map.items():
+        present = int(row[colname].iloc[0])
+        records.append({"Town": label, "Type": t_label, "Present": present})
+    return pd.DataFrame(records)
+
+profile_main = build_town_profile(df, selected_town, selected_town)
+if compare_town != "(None)":
+    profile_cmp = build_town_profile(df, compare_town, compare_town)
+    prof_all = pd.concat([profile_main, profile_cmp], ignore_index=True)
+else:
+    prof_all = profile_main.copy()
+
+# Filter by energy types chosen
+if types_chosen:
+    prof_all = prof_all[prof_all["Type"].isin(types_chosen)]
+else:
+    st.info("Select at least one energy type to display.")
+    prof_all = prof_all.iloc[0:0]
+
+# Clustered bars (column facet per Town)
+chart4 = (
+    alt.Chart(prof_all)
+    .mark_bar()
+    .encode(
+        x=alt.X("Type:N", title="Energy Type"),
+        y=alt.Y("Present:Q", title="Presence (0/1)", scale=alt.Scale(domain=[0, 1])),
+        column=alt.Column("Town:N", title=None),
+        color=alt.Color("Type:N", legend=None),
+        tooltip=["Town:N", "Type:N", "Present:Q"],
+    )
+    .properties(height=300)
+)
+
+st.altair_chart(chart4, use_container_width=True)
+
+with st.expander("Summary"):
+    if not prof_all.empty:
+        by_town = (
+            prof_all.groupby(["Town"])["Present"]
+            .sum()
+            .reset_index()
+            .rename(columns={"Present": "Number of energy types present"})
+        )
+        st.dataframe(by_town, use_container_width=True)
+    else:
+        st.write("No types selected.")
+
+# ----------------------------
+# Footer
+# ----------------------------
+st.caption("Upload an updated CSV anytime from the sidebar. Town names are automatically cleaned from links to readable names.")
