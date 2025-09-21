@@ -1,5 +1,5 @@
 # app.py
-# Visual 2: Overall Alternative Energy Adoption by Governorate (stacked, like screenshot)
+# Visual 2: Overall Alternative Energy Adoption by Governorate (stacked; % math fixed)
 # Visual 4: Town Alternative Energy Profile (compare towns)
 # Town names cleaned from links/URIs.
 
@@ -22,6 +22,7 @@ DATA_PATH_GUESS = "325 data.csv"
 # Helpers
 # ----------------------------
 def extract_name_from_link(val: str) -> str:
+    """Turn a URL/DBpedia URI into a readable name; otherwise return trimmed text."""
     if pd.isna(val):
         return val
     s = str(val).strip()
@@ -38,20 +39,20 @@ def load_data(uploaded_file=None):
         df = pd.read_csv(uploaded_file)
     else:
         if not os.path.exists(DATA_PATH_GUESS):
-            st.error("CSV not found. Upload it from the sidebar or place '325 data.csv' next to app.py.")
+            st.error("CSV not found. Upload from the sidebar or place '325 data.csv' next to app.py.")
             st.stop()
         df = pd.read_csv(DATA_PATH_GUESS)
 
     df.columns = [c.strip() for c in df.columns]
 
-    # Clean Town
+    # Clean Town column
     town_col = None
     for cand in ["Town", "town", "Municipality", "municipality"]:
         if cand in df.columns:
             town_col = cand
             break
     if town_col is None:
-        st.error("Could not find a 'Town' column. Please ensure your CSV has a Town/municipality column.")
+        st.error("Could not find a 'Town' column. Please ensure your CSV has one.")
         st.stop()
     df[town_col] = df[town_col].apply(extract_name_from_link)
 
@@ -69,18 +70,13 @@ def load_data(uploaded_file=None):
 
     COLS = {
         "town": town_col,
-        # Lighting (not used now for V2, but kept for compatibility)
-        "light_good": "State of the lighting network - good",
-        "light_ok": "State of the lighting network - acceptable",
-        "light_bad": "State of the lighting network - bad",
-        # Alternative energy
         "solar": "Type of alternative energy used - solar energy",
         "wind": "Type of alternative energy used - wind energy",
         "hydro": "Type of alternative energy used - hydropower (water use)",
         "other": "Type of alternative energy used - other",
     }
-    needed = [COLS["solar"], COLS["wind"], COLS["hydro"], COLS["other"]]
-    for c in needed:
+    type_cols = [COLS["solar"], COLS["wind"], COLS["hydro"], COLS["other"]]
+    for c in type_cols:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
@@ -88,32 +84,34 @@ def load_data(uploaded_file=None):
     return df, COLS
 
 # ----------------------------
-# Sidebar
+# Sidebar (upload)
 # ----------------------------
 st.sidebar.header("Data")
 uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
 df, COLS = load_data(uploaded)
 
 st.title("🔌 Municipal Energy Explorer")
-st.caption("Showing Visual 2 (overall alt energy adoption) and Visual 4 (town profiles). Town names are cleaned from links.")
+st.caption("Only Visual 2 (overall alt-energy adoption) and Visual 4 (town profiles). Town names are cleaned from links.")
 
 # ======================================================
-# VISUAL 2 — Overall Alternative Energy Adoption by Governorate
-# (stacked bars of Solar/Wind/Hydro/Other counts; % toggle + sort control)
+# VISUAL 2 — Overall Alternative Energy Adoption by Governorate (fixed % math)
 # ======================================================
 st.markdown("### 2) Overall Alternative Energy Adoption — by Governorate")
 
-energy_map = {
-    "solar energy": COLS["solar"],
-    "wind energy": COLS["wind"],
-    "hydropower (water use)": COLS["hydro"],
-    "other": COLS["other"],
+energy_map_display = {
+    "Solar": COLS["solar"],
+    "Wind":  COLS["wind"],
+    "Hydro": COLS["hydro"],
+    "Other": COLS["other"],
 }
 
 left, mid, right = st.columns([2, 2, 1])
 with left:
-    normalize = st.checkbox("Show as % of towns using any alternative energy", value=False,
-                            help="Normalize each governorate to 100% of towns that use ≥1 energy type.")
+    normalize = st.checkbox(
+        "Show as % of towns using any alternative energy",
+        value=True,
+        help="Each adopting town contributes a total of 1, split across the types it uses."
+    )
 with mid:
     sort_by = st.selectbox(
         "Sort governorates by",
@@ -121,11 +119,13 @@ with mid:
         index=0
     )
 with right:
-    show_values = st.checkbox("Show value labels", value=False)
+    show_values = st.checkbox("Show value labels (counts view)", value=False)
 
-# Compute per governorate how many towns use each energy type (0/1 columns)
-grp = (
-    df.groupby("Governorate", dropna=False)[list(energy_map.values())]
+type_cols = list(energy_map_display.values())
+
+# Raw counts per governorate (for counts view + sorting)
+grp_counts = (
+    df.groupby("Governorate", dropna=False)[type_cols]
     .sum()
     .reset_index()
     .rename(columns={
@@ -135,39 +135,73 @@ grp = (
         COLS["other"]: "Other",
     })
 )
-# Total adopting towns (town with ≥1 type)
-any_adopt = (df.assign(any_type=df[list(energy_map.values())].sum(axis=1).clip(upper=1))
-             .groupby("Governorate", dropna=False)["any_type"].sum()
-             .reset_index()
-             .rename(columns={"any_type": "Total adopting towns"}))
-grp = grp.merge(any_adopt, on="Governorate", how="left")
 
-# Melt for stacked bars
-tall = grp.melt(
-    id_vars=["Governorate", "Total adopting towns"],
-    value_vars=["Solar", "Wind", "Hydro", "Other"],
-    var_name="Energy type",
-    value_name="count"
+# Number of adopting towns per governorate
+df_any = df.assign(types_count=df[type_cols].sum(axis=1))
+any_mask = df_any["types_count"] > 0
+adopting_per_gov = (
+    df_any.groupby("Governorate", dropna=False)["types_count"]
+    .apply(lambda s: (s > 0).sum())
+    .reset_index()
+    .rename(columns={"types_count": "Total adopting towns"})
 )
 
-# Normalize to percent of adopting towns if requested
+grp_counts = grp_counts.merge(adopting_per_gov, on="Governorate", how="left")
+
+# Normalized contributions (each adopting town contributes 1 split across its present types)
 if normalize:
-    tall["pct"] = np.where(tall["Total adopting towns"] > 0,
-                           tall["count"] / tall["Total adopting towns"], 0.0)
+    df_norm = df_any.loc[any_mask, ["Governorate", *type_cols, "types_count"]].copy()
+    for c in type_cols:
+        df_norm[c] = df_norm[c] / df_norm["types_count"]
+
+    grp_norm = (
+        df_norm.groupby("Governorate", dropna=False)[type_cols]
+        .sum()
+        .reset_index()
+        .rename(columns={
+            COLS["solar"]: "Solar",
+            COLS["wind"]: "Wind",
+            COLS["hydro"]: "Hydro",
+            COLS["other"]: "Other",
+        })
+    ).merge(adopting_per_gov, on="Governorate", how="left")
+
+    tall = grp_norm.melt(
+        id_vars=["Governorate", "Total adopting towns"],
+        value_vars=["Solar", "Wind", "Hydro", "Other"],
+        var_name="Energy type",
+        value_name="town_equivalents"
+    )
+    tall["pct"] = np.where(
+        tall["Total adopting towns"] > 0,
+        tall["town_equivalents"] / tall["Total adopting towns"],
+        0.0
+    )
+else:
+    tall = grp_counts.melt(
+        id_vars=["Governorate", "Total adopting towns"],
+        value_vars=["Solar", "Wind", "Hydro", "Other"],
+        var_name="Energy type",
+        value_name="count"
+    )
 
 # Sorting
 if sort_by == "Alphabetical":
-    sort_order = sorted(grp["Governorate"].fillna("Unknown").tolist())
+    sort_order = sorted(grp_counts["Governorate"].fillna("Unknown").tolist())
 elif sort_by == "Total adopting towns":
-    sort_order = grp.sort_values("Total adopting towns", ascending=False)["Governorate"].tolist()
+    sort_order = grp_counts.sort_values("Total adopting towns", ascending=False)["Governorate"].tolist()
 else:
-    col = {"Solar": "Solar", "Wind": "Wind", "Hydro": "Hydro", "Other": "Other"}[sort_by]
-    sort_order = grp.sort_values(col, ascending=False)["Governorate"].tolist()
+    metric_col = {"Solar": "Solar", "Wind": "Wind", "Hydro": "Hydro", "Other": "Other"}[sort_by]
+    sort_order = grp_counts.sort_values(metric_col, ascending=False)["Governorate"].tolist()
 
-# Build chart
+# Chart
 if normalize:
     y = alt.Y("pct:Q", axis=alt.Axis(format="%"), title="Share of adopting towns")
-    tooltip = ["Governorate:N", "Energy type:N", "count:Q", "Total adopting towns:Q", alt.Tooltip("pct:Q", format=".0%")]
+    tooltip = [
+        "Governorate:N", "Energy type:N",
+        alt.Tooltip("pct:Q", format=".0%"),
+        "Total adopting towns:Q",
+    ]
 else:
     y = alt.Y("count:Q", title="Number of towns")
     tooltip = ["Governorate:N", "Energy type:N", "count:Q", "Total adopting towns:Q"]
@@ -184,9 +218,6 @@ chart2 = (
     .properties(height=460)
 )
 
-st.altair_chart(chart2, use_container_width=True)
-
-# Optional value labels
 if show_values and not normalize:
     labels = (
         alt.Chart(tall)
@@ -199,6 +230,8 @@ if show_values and not normalize:
         )
     )
     st.altair_chart(chart2 + labels, use_container_width=True)
+else:
+    st.altair_chart(chart2, use_container_width=True)
 
 st.divider()
 
@@ -209,7 +242,7 @@ st.markdown("### 4) Town Alternative Energy Profile")
 
 energy_map_simple = {
     "Solar": COLS["solar"],
-    "Wind": COLS["wind"],
+    "Wind":  COLS["wind"],
     "Hydro": COLS["hydro"],
     "Other": COLS["other"],
 }
