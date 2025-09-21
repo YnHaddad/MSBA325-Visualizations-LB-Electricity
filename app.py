@@ -105,7 +105,7 @@ energy_map_display = {
     "Other": COLS["other"],
 }
 
-left, mid, right = st.columns([2, 2, 1])
+left, mid = st.columns([2, 2])
 with left:
     normalize = st.checkbox(
         "Show as % of towns using any alternative energy",
@@ -118,8 +118,6 @@ with mid:
         ["Total adopting towns", "Solar", "Wind", "Hydro", "Other", "Alphabetical"],
         index=0
     )
-with right:
-    show_values = st.checkbox("Show value labels (counts view)", value=False)
 
 type_cols = list(energy_map_display.values())
 
@@ -218,20 +216,7 @@ chart2 = (
     .properties(height=460)
 )
 
-if show_values and not normalize:
-    labels = (
-        alt.Chart(tall)
-        .mark_text(dy=-4)
-        .encode(
-            x=alt.X("Governorate:N", sort=sort_order),
-            y=alt.Y("count:Q"),
-            detail="Energy type:N",
-            text=alt.Text("count:Q")
-        )
-    )
-    st.altair_chart(chart2 + labels, use_container_width=True)
-else:
-    st.altair_chart(chart2, use_container_width=True)
+st.altair_chart(chart2, use_container_width=True)
 
 st.divider()
 
