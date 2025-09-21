@@ -1,5 +1,5 @@
 # app.py
-# Visual 2: Overall Alternative Energy Adoption by Governorate (stacked; % math fixed)
+# Visual 2: Overall Alternative Energy Adoption by Governorate (stacked; % math fixed; %-aware sorting)
 # Visual 4: Town Alternative Energy Profile (compare towns)
 # Town names cleaned from links/URIs.
 
@@ -94,7 +94,7 @@ st.title("🔌 Municipal Energy Explorer")
 st.caption("Only Visual 2 (overall alt-energy adoption) and Visual 4 (town profiles). Town names are cleaned from links.")
 
 # ======================================================
-# VISUAL 2 — Overall Alternative Energy Adoption by Governorate (fixed % math)
+# VISUAL 2 — Overall Alternative Energy Adoption by Governorate (fixed % math, %-aware sorting)
 # ======================================================
 st.markdown("### 2) Overall Alternative Energy Adoption — by Governorate")
 
@@ -183,14 +183,23 @@ else:
         value_name="count"
     )
 
-# Sorting
+# ---------- %-aware sorting ----------
 if sort_by == "Alphabetical":
     sort_order = sorted(grp_counts["Governorate"].fillna("Unknown").tolist())
 elif sort_by == "Total adopting towns":
     sort_order = grp_counts.sort_values("Total adopting towns", ascending=False)["Governorate"].tolist()
 else:
-    metric_col = {"Solar": "Solar", "Wind": "Wind", "Hydro": "Hydro", "Other": "Other"}[sort_by]
-    sort_order = grp_counts.sort_values(metric_col, ascending=False)["Governorate"].tolist()
+    metric_col = sort_by  # "Solar", "Wind", "Hydro", or "Other"
+    if normalize:
+        # Use % values for that energy type in the normalized tall table
+        pct_table = tall[tall["Energy type"] == metric_col][["Governorate", "pct"]].copy()
+        pct_table["pct"] = pct_table["pct"].fillna(0)
+        sort_order = pct_table.sort_values("pct", ascending=False)["Governorate"].tolist()
+    else:
+        # Use raw counts for that energy type
+        cnt_table = tall[tall["Energy type"] == metric_col][["Governorate", "count"]].copy()
+        cnt_table["count"] = cnt_table["count"].fillna(0)
+        sort_order = cnt_table.sort_values("count", ascending=False)["Governorate"].tolist()
 
 # Chart
 if normalize:
