@@ -9,24 +9,19 @@ from urllib.parse import unquote
 st.set_page_config(page_title="Lebanon Energy — Visual 2 & 4", page_icon="⚡", layout="wide")
 st.title("⚡ Lebanon Energy — Interactive Visuals (Visual 2 & Visual 4)")
 
+# -------------------------------- Config --------------------------------
+DATA_PATH = Path("325 data.csv")  # <- change this if your CSV has a different name
+
 # ---------------- Helpers ----------------
-@st.cache_data
-def load_csv_auto(uploaded_file):
-    """Load from uploader, else fall back to local '325 data.csv'."""
-    if uploaded_file is not None:
-        return pd.read_csv(uploaded_file)
-    p = Path("325 data.csv")
-    return pd.read_csv(p) if p.exists() else None
+def load_csv_local(path: Path) -> pd.DataFrame | None:
+    return pd.read_csv(path) if path.exists() else None
 
 def coerce_bool(s: pd.Series) -> pd.Series:
-    if s is None:
-        return pd.Series([False] * 0, dtype=bool)
-    if pd.api.types.is_bool_dtype(s):
-        return s.fillna(False)
+    if s is None: return pd.Series([False] * 0, dtype=bool)
+    if pd.api.types.is_bool_dtype(s): return s.fillna(False)
     s_num = pd.to_numeric(s, errors="coerce")
-    if s_num.notna().any():
-        return (s_num.fillna(0) != 0)
-    return s.astype(str).str.strip().str.lower().isin({"yes", "y", "true", "t", "1"})
+    if s_num.notna().any(): return (s_num.fillna(0) != 0)
+    return s.astype(str).str.strip().str.lower().isin({"yes","y","true","t","1"})
 
 def clean_town_name(series: pd.Series) -> pd.Series:
     s = series.astype(str)
@@ -34,9 +29,9 @@ def clean_town_name(series: pd.Series) -> pd.Series:
     tail = tail.str.extract(r'([^/]+)$')[0].fillna(s)
     tail = tail.map(lambda x: unquote(x) if isinstance(x, str) else x)
     return (tail
-            .str.replace('_', ' ', regex=False)
-            .str.replace('-', ' ', regex=False)
-            .str.replace(r'\s+', ' ', regex=True)
+            .str.replace('_',' ',regex=False)
+            .str.replace('-',' ',regex=False)
+            .str.replace(r'\s+',' ',regex=True)
             .str.strip())
 
 def derive_onehot_label(row: pd.Series, mapping: dict, default="Unknown"):
@@ -45,16 +40,11 @@ def derive_onehot_label(row: pd.Series, mapping: dict, default="Unknown"):
             return label
     return default
 
-# ---------------- Load data ----------------
-with st.sidebar:
-    st.header("📁 Data")
-    uploaded = st.file_uploader("Upload CSV", type=["csv"], help="If omitted, the app will try to read '325 data.csv' next to app.py.")
-
-df = load_csv_auto(uploaded)
+# ---------------- Load data (local only; no uploader) ----------------
+df = load_csv_local(DATA_PATH)
 if df is None:
-    st.info("⬆️ Upload your CSV (or put **325 data.csv** next to app.py).")
+    st.error(f"Could not find **{DATA_PATH}**. Place your CSV next to `app.py` (or update `DATA_PATH`).")
     st.stop()
-
 df = df.copy()
 
 # ---------------- Cleaned town + governorate ----------------
@@ -79,11 +69,9 @@ else:
 # ---------------- Column constants ----------------
 COL_EXISTS_YES = "Existence of alternative energy - exists"
 COL_EXISTS_NO  = "Existence of alternative energy - does not exist"
-
 COL_GRID_GOOD  = "State of the power grid - good"
 COL_GRID_OK    = "State of the power grid - acceptable"
 COL_GRID_BAD   = "State of the power grid - bad"
-
 COL_LIGHT_GOOD = "State of the lighting network - good"
 COL_LIGHT_OK   = "State of the lighting network - acceptable"
 COL_LIGHT_BAD  = "State of the lighting network - bad"
@@ -119,16 +107,24 @@ df["_light_label"] = df.apply(
     lambda r: derive_onehot_label(r, {"Good": COL_LIGHT_GOOD, "Acceptable": COL_LIGHT_OK, "Bad": COL_LIGHT_BAD}), axis=1
 )
 
-# ---------------- Sidebar filters ----------------
-govs = sorted(df[COL_GOV].dropna().astype(str).unique().tolist())
+# ---------------- Sidebar filters (with search) ----------------
+govs_all = sorted(df[COL_GOV].dropna().astype(str).unique().tolist())
 with st.sidebar:
     st.header("🔎 Filters")
-    sel_govs = st.multiselect("Filter by governorate", options=govs, default=govs)
+    gov_search = st.text_input("Search governorate", placeholder="type to filter…").strip().lower()
+    if gov_search:
+        gov_options = [g for g in govs_all if gov_search in g.lower()]
+        if not gov_options:
+            st.caption("No matches — showing all.")
+            gov_options = govs_all
+    else:
+        gov_options = govs_all
+    sel_govs = st.multiselect("Filter by governorate", options=gov_options, default=gov_options)
+    if not sel_govs:
+        sel_govs = gov_options  # ensure at least something selected
+
     min_adopt = st.slider("Minimum adoption rate (%)", 0, 100, 0, 1)
-    st.markdown("---")
-    st.subheader("📊 Visual 2 Options")
-    stack_mode = st.radio("Stack mode", ["Counts", "Percent"], horizontal=True)
-    town_sample_max = st.slider("Towns listed in tooltip (per segment)", 0, 50, 12)
+
     st.markdown("---")
     st.subheader("🔥 Visual 4 Options")
     norm_axis = st.radio("Normalize heatmap by", ["None", "Grid state", "Lighting state"], horizontal=True)
@@ -138,16 +134,16 @@ df_filt = df.loc[mask].copy()
 
 tab2, tab4 = st.tabs(["📊 Visual 2 — Stacked Bar by Governorate", "🧯 Visual 4 — Heatmap: Grid × Lighting"])
 
-# ---------------- Visual 2 ----------------
+# ---------------- Visual 2 (Percent-only stacked) ----------------
 with tab2:
-    st.subheader("Visual 2 — Alternative Energy by Governorate (Stacked)")
+    st.subheader("Visual 2 — Alternative Energy by Governorate (Share within governorate)")
     long_frames = []
     for c in ENERGY_COLS:
         flag = coerce_bool(df_filt[c])
         towns = (
             df_filt.loc[flag, [COL_GOV, "_town_clean"]]
             .groupby(COL_GOV, dropna=False)["_town_clean"]
-            .agg(lambda s: list(s[:town_sample_max]))
+            .agg(lambda s: list(s[:12]))  # sample towns for tooltip
             .reset_index()
             .rename(columns={"_town_clean": "Towns (sample)"})
         )
@@ -167,24 +163,20 @@ with tab2:
 
     long_df = pd.concat(long_frames, ignore_index=True)
     totals = long_df.groupby(COL_GOV)["Count"].sum().sort_values(ascending=False).index.tolist()
-    y_field = alt.Y(
-        "Count:Q",
-        stack=("normalize" if stack_mode == "Percent" else None),
-        title=("Share of towns (%)" if stack_mode == "Percent" else "Number of towns")
-    )
+
     chart_v2 = (
         alt.Chart(long_df)
         .mark_bar()
         .encode(
             x=alt.X(f"{COL_GOV}:N", sort=totals, title="Governorate"),
-            y=y_field,
+            y=alt.Y("Count:Q", stack="normalize", title="Share of towns (%)"),
             color=alt.Color("Energy Type:N", legend=alt.Legend(title="Energy Type")),
             order=alt.Order("Energy Type:N"),
             tooltip=[
                 alt.Tooltip(f"{COL_GOV}:N", title="Governorate"),
                 alt.Tooltip("Energy Type:N"),
-                alt.Tooltip("Count:Q"),
-                alt.Tooltip("Towns (sample):N", title="Towns"),
+                alt.Tooltip("Count:Q", title="Towns (count)"),
+                alt.Tooltip("Towns (sample):N", title="Sample towns"),
             ],
         )
         .properties(height=430)
@@ -193,11 +185,10 @@ with tab2:
     selection = alt.selection_point(fields=["Energy Type"], bind="legend")
     st.altair_chart(chart_v2.add_params(selection).transform_filter(selection), use_container_width=True)
 
-# ---------------- Visual 4 ----------------
+# ---------------- Visual 4 (Heatmap) ----------------
 with tab4:
     st.subheader("Visual 4 — Heatmap: Grid State × Lighting State")
     st.caption("Cells show the number of towns (or share) for each Grid × Lighting combination.")
-
     grp = df_filt.groupby(["_grid_label", "_light_label"], dropna=False).size().reset_index(name="Count")
     towns = (
         df_filt.groupby(["_grid_label", "_light_label"], dropna=False)["_town_clean"]
@@ -243,7 +234,6 @@ with tab4:
         )
         .properties(height=420)
     )
-
     labels = (
         alt.Chart(heat)
         .mark_text(fontWeight="bold")
