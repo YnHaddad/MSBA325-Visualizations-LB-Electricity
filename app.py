@@ -55,7 +55,7 @@ def derive_onehot_label(row: pd.Series, mapping: dict, default="Unknown"):
             return label
     return default
 
-# ---------------- Load data (local only) ----------------
+# ---------------- Load data ----------------
 df = load_csv_local(DATA_PATH)
 if df is None:
     st.error(f"Could not find **{DATA_PATH}**. Place your CSV next to `app.py` (or update `DATA_PATH`).")
@@ -114,23 +114,19 @@ if not ENERGY_COLS:
     st.stop()
 
 # ---------------- Adoption % (detect real column; else fallback) ----------------
-# 1) heuristic candidates by name
 name_hits = [c for c in df.columns if ("adopt" in c.lower()) or c.strip().endswith("%")]
-# 2) numeric-in-range candidates (0..100 with at least 3 unique values)
 range_hits = [c for c in df.columns
               if pd.api.types.is_numeric_dtype(df[c])
               and df[c].dropna().between(0, 100).mean() > 0.95
               and df[c].nunique(dropna=True) >= 3]
+candidates = list(dict.fromkeys(name_hits + range_hits))
+adopt_choice = st.sidebar.selectbox(
+    "Adoption column",
+    options=["<Use existence flags (0/100)>"] + candidates,
+    index=(0 if not candidates else 1),
+    help="Pick your numeric adoption column if you have one."
+)
 
-candidates = list(dict.fromkeys(name_hits + range_hits))  # stable de-dup, name hits first
-options = ["<Use existence flags (0/100)>"] + candidates
-
-with st.sidebar:
-    st.header("🔎 Filters")
-    adopt_choice = st.selectbox("Adoption column", options=options, index=0,
-                                help="Choose your numeric adoption column if you have one.")
-
-# compute adoption_pct
 if adopt_choice != "<Use existence flags (0/100)>":
     df["_adoption_pct"] = coerce_percent(df[adopt_choice]).clip(lower=0, upper=100)
 else:
@@ -140,7 +136,7 @@ else:
         df["_adoption_pct"] = np.where(exists_yes, 100.0, np.where(exists_no, 0.0, np.nan))
     else:
         df["_adoption_pct"] = np.nan
-        st.warning("No adoption column selected and existence flags not found; adoption filter will be disabled.")
+        st.warning("No adoption column selected and existence flags missing; adoption filter will be disabled.")
 
 # Grid & lighting labels
 df["_grid_label"] = df.apply(
@@ -152,9 +148,11 @@ df["_light_label"] = df.apply(
     axis=1
 )
 
-# ---------------- Sidebar (continued): gov search + adoption range + heatmap option ----------------
+# ---------------- Sidebar filters (search + adoption range + toggles) ----------------
 govs_all = sorted(df[COL_GOV].dropna().astype(str).unique().tolist())
 with st.sidebar:
+    st.header("🔎 Filters")
+
     gov_search = st.text_input("Search governorate", placeholder="type to filter…").strip().lower()
     if gov_search:
         gov_options = [g for g in govs_all if gov_search in g.lower()]
@@ -167,7 +165,7 @@ with st.sidebar:
     if not sel_govs:
         sel_govs = gov_options
 
-    # Dynamic adoption range (uses actual min/max of selected column)
+    # Adoption range (based on chosen column / fallback)
     if df["_adoption_pct"].notna().any():
         data_min = float(np.nanmin(df["_adoption_pct"]))
         data_max = float(np.nanmax(df["_adoption_pct"]))
@@ -182,11 +180,17 @@ with st.sidebar:
         adopt_range = (0.0, 100.0)
         st.caption("Adoption filter disabled (no adoption data).")
 
+    # Bring back Counts vs Percent for Visual 2
+    st.markdown("---")
+    st.subheader("📊 Visual 2 Options")
+    stack_mode = st.radio("Y-axis mode", ["Counts", "Percent"], horizontal=True)
+    town_sample_max = st.slider("Towns listed in tooltip (per segment)", 0, 50, 12)
+
     st.markdown("---")
     st.subheader("🔥 Visual 4 Options")
     norm_axis = st.radio("Normalize heatmap by", ["None", "Grid state", "Lighting state"], horizontal=True)
 
-# Filter
+# Filter rows
 mask_gov = df[COL_GOV].astype(str).isin(sel_govs)
 if df["_adoption_pct"].notna().any():
     mask_adopt = df["_adoption_pct"].between(adopt_range[0], adopt_range[1], inclusive="both").fillna(False)
@@ -195,57 +199,79 @@ else:
 mask = mask_gov & mask_adopt
 df_filt = df.loc[mask].copy()
 
+# Context caption
 if df["_adoption_pct"].notna().any():
-    st.caption(f"Using **{adopt_choice if adopt_choice != '<Use existence flags (0/100)>' else 'existence flags'}**, "
-               f"showing adoption **{adopt_range[0]}–{adopt_range[1]}%**.")
+    st.caption(
+        f"Using **{adopt_choice if adopt_choice != '<Use existence flags (0/100)>' else 'existence flags'}**, "
+        f"showing adoption **{adopt_range[0]}–{adopt_range[1]}%**."
+    )
 
 # Tabs
 tab2, tab4 = st.tabs(["📊 Visual 2 — Stacked Bar by Governorate", "🧯 Visual 4 — Heatmap: Grid × Lighting"])
 
-# ---------------- Visual 2 (Percent-only stacked) ----------------
+# ---------------- Visual 2 (Counts or Percent) ----------------
 with tab2:
-    st.subheader("Visual 2 — Alternative Energy by Governorate (Share within governorate)")
+    st.subheader("Visual 2 — Alternative Energy by Governorate")
 
+    # Build long-form with per-segment count, mean adoption, and town samples with adoption %
     long_frames = []
     for c in ENERGY_COLS:
         flag = coerce_bool(df_filt[c])
+
+        seg = df_filt.loc[flag, [COL_GOV, "_town_clean", "_adoption_pct"]].copy()
+        # Prepare sample of "Town (12.3%)"
+        seg["_town_label"] = seg.apply(
+            lambda r: f"{r['_town_clean']} ({r['_adoption_pct']:.1f}%)" if pd.notna(r["_adoption_pct"]) else f"{r['_town_clean']}",
+            axis=1
+        )
+
+        # aggregate
         towns = (
-            df_filt.loc[flag, [COL_GOV, "_town_clean"]]
-            .groupby(COL_GOV, dropna=False)["_town_clean"]
-            .agg(lambda s: list(s[:12]))
-            .reset_index()
-            .rename(columns={"_town_clean": "Towns (sample)"})
+            seg.groupby(COL_GOV, dropna=False)["_town_label"]
+               .agg(lambda s: ", ".join(list(s[:town_sample_max])) if len(s) else "—")
+               .reset_index()
+               .rename(columns={"_town_label": "Towns (sample + adoption)"})
         )
         counts = (
-            df_filt.assign(_flag=flag)
-                  .groupby(COL_GOV, dropna=False)["_flag"]
-                  .sum()
-                  .rename("Count")
-                  .reset_index()
+            seg.groupby(COL_GOV, dropna=False)["_town_clean"]
+               .size()
+               .reset_index(name="Count")
         )
-        merged = counts.merge(towns, on=COL_GOV, how="left")
+        means = (
+            seg.groupby(COL_GOV, dropna=False)["_adoption_pct"]
+               .mean()
+               .reset_index(name="Mean adoption (%)")
+        )
+
+        merged = counts.merge(means, on=COL_GOV, how="left").merge(towns, on=COL_GOV, how="left")
         merged["Energy Type"] = c.replace("Type of alternative energy used - ", "").title()
-        merged["Towns (sample)"] = merged["Towns (sample)"].apply(
-            lambda lst: ", ".join(lst) if isinstance(lst, list) and len(lst) else "—"
-        )
         long_frames.append(merged)
 
     long_df = pd.concat(long_frames, ignore_index=True)
+    long_df["Mean adoption (%)"] = long_df["Mean adoption (%)"].round(1)
+
+    # Order x by total Count descending (Counts mode) or by total share (Percent is normalized anyway)
     totals = long_df.groupby(COL_GOV)["Count"].sum().sort_values(ascending=False).index.tolist()
+
+    if stack_mode == "Percent":
+        y_enc = alt.Y("Count:Q", stack="normalize", title="Share of towns (%)")
+    else:
+        y_enc = alt.Y("Count:Q", stack=None, title="Number of towns")
 
     chart_v2 = (
         alt.Chart(long_df)
         .mark_bar()
         .encode(
             x=alt.X(f"{COL_GOV}:N", sort=totals, title="Governorate"),
-            y=alt.Y("Count:Q", stack="normalize", title="Share of towns (%)"),
+            y=y_enc,
             color=alt.Color("Energy Type:N", legend=alt.Legend(title="Energy Type")),
             order=alt.Order("Energy Type:N"),
             tooltip=[
                 alt.Tooltip(f"{COL_GOV}:N", title="Governorate"),
                 alt.Tooltip("Energy Type:N"),
-                alt.Tooltip("Count:Q", title="Towns (count)"),
-                alt.Tooltip("Towns (sample):N", title="Sample towns"),
+                alt.Tooltip("Count:Q"),
+                alt.Tooltip("Mean adoption (%):Q", title="Mean adoption (%)", format=".1f"),
+                alt.Tooltip("Towns (sample + adoption):N", title="Sample towns"),
             ],
         )
         .properties(height=430)
@@ -268,14 +294,14 @@ with tab4:
     heat = grp.merge(towns, on=["_grid_label", "_light_label"], how="left")
 
     if norm_axis == "Grid state":
-        totals = heat.groupby("_grid_label")["Count"].transform("sum").replace(0, np.nan)
-        heat["Value"] = (heat["Count"] / totals) * 100
+        totals_h = heat.groupby("_grid_label")["Count"].transform("sum").replace(0, np.nan)
+        heat["Value"] = (heat["Count"] / totals_h) * 100
         value_title = "Share within grid state (%)"
         color_field = alt.Color("Value:Q", title=value_title, scale=alt.Scale(scheme="blues"))
         tooltip_val = alt.Tooltip("Value:Q", title=value_title, format=".1f")
     elif norm_axis == "Lighting state":
-        totals = heat.groupby("_light_label")["Count"].transform("sum").replace(0, np.nan)
-        heat["Value"] = (heat["Count"] / totals) * 100
+        totals_h = heat.groupby("_light_label")["Count"].transform("sum").replace(0, np.nan)
+        heat["Value"] = (heat["Count"] / totals_h) * 100
         value_title = "Share within lighting state (%)"
         color_field = alt.Color("Value:Q", title=value_title, scale=alt.Scale(scheme="blues"))
         tooltip_val = alt.Tooltip("Value:Q", title=value_title, format=".1f")
