@@ -1,7 +1,8 @@
 # app.py
 # Visual 2: Overall Alternative Energy Adoption by Governorate (stacked; % math fixed; %-aware sorting)
-# Visual 4: Town Alternative Energy Profile (compare towns)
+# Visual 3: Alternative Energy Adoption vs. Power Grid State
 # Town names cleaned from links/URIs.
+# No sidebar upload — reads 325 data.csv in current folder.
 
 import os
 import re
@@ -11,12 +12,12 @@ import streamlit as st
 import altair as alt
 
 st.set_page_config(
-    page_title="Municipal Energy Explorer — Visuals 2 & 4",
+    page_title="Municipal Energy Explorer — Visuals 2 & 3",
     layout="wide",
     page_icon="🔌",
 )
 
-DATA_PATH_GUESS = "325 data.csv"
+DATA_FILE = "325 data.csv"
 
 # ----------------------------
 # Helpers
@@ -34,15 +35,12 @@ def extract_name_from_link(val: str) -> str:
     return s
 
 @st.cache_data(show_spinner=False)
-def load_data(uploaded_file=None):
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-    else:
-        if not os.path.exists(DATA_PATH_GUESS):
-            st.error("CSV not found. Upload from the sidebar or place '325 data.csv' next to app.py.")
-            st.stop()
-        df = pd.read_csv(DATA_PATH_GUESS)
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        st.error(f"CSV not found: {DATA_FILE}")
+        st.stop()
 
+    df = pd.read_csv(DATA_FILE)
     df.columns = [c.strip() for c in df.columns]
 
     # Clean Town column
@@ -74,9 +72,14 @@ def load_data(uploaded_file=None):
         "wind": "Type of alternative energy used - wind energy",
         "hydro": "Type of alternative energy used - hydropower (water use)",
         "other": "Type of alternative energy used - other",
+        "grid_good": "State of the power grid - good",
+        "grid_ok": "State of the power grid - acceptable",
+        "grid_bad": "State of the power grid - bad",
     }
+
     type_cols = [COLS["solar"], COLS["wind"], COLS["hydro"], COLS["other"]]
-    for c in type_cols:
+    grid_cols = [COLS["grid_good"], COLS["grid_ok"], COLS["grid_bad"]]
+    for c in type_cols + grid_cols:
         if c not in df.columns:
             df[c] = 0
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
@@ -84,14 +87,17 @@ def load_data(uploaded_file=None):
     return df, COLS
 
 # ----------------------------
-# Sidebar (upload)
+# Load data
 # ----------------------------
-st.sidebar.header("Data")
-uploaded = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
-df, COLS = load_data(uploaded)
+df, COLS = load_data()
 
 st.title("🔌 Municipal Energy Explorer")
-st.caption("Only Visual 2 (overall alt-energy adoption) and Visual 4 (town profiles). Town names are cleaned from links.")
+st.caption("Visuals 2 (overall adoption) and 3 (adoption vs grid). Town names are cleaned from links.")
+
+# Precompute helper columns
+type_cols = [COLS["solar"], COLS["wind"], COLS["hydro"], COLS["other"]]
+df_any = df.assign(types_count=df[type_cols].sum(axis=1))
+any_mask = df_any["types_count"] > 0  # towns with ≥1 alternative type
 
 # ======================================================
 # VISUAL 2 — Overall Alternative Energy Adoption by Governorate (fixed % math, %-aware sorting)
@@ -119,11 +125,9 @@ with mid:
         index=0
     )
 
-type_cols = list(energy_map_display.values())
-
-# Raw counts per governorate (for counts view + sorting)
+# Raw counts per governorate
 grp_counts = (
-    df.groupby("Governorate", dropna=False)[type_cols]
+    df.groupby("Governorate", dropna=False)[list(energy_map_display.values())]
     .sum()
     .reset_index()
     .rename(columns={
@@ -134,26 +138,23 @@ grp_counts = (
     })
 )
 
-# Number of adopting towns per governorate
-df_any = df.assign(types_count=df[type_cols].sum(axis=1))
-any_mask = df_any["types_count"] > 0
+# # adopting towns
 adopting_per_gov = (
     df_any.groupby("Governorate", dropna=False)["types_count"]
     .apply(lambda s: (s > 0).sum())
     .reset_index()
     .rename(columns={"types_count": "Total adopting towns"})
 )
-
 grp_counts = grp_counts.merge(adopting_per_gov, on="Governorate", how="left")
 
-# Normalized contributions (each adopting town contributes 1 split across its present types)
+# Normalized contributions
 if normalize:
-    df_norm = df_any.loc[any_mask, ["Governorate", *type_cols, "types_count"]].copy()
-    for c in type_cols:
+    df_norm = df_any.loc[any_mask, ["Governorate", *list(energy_map_display.values()), "types_count"]].copy()
+    for c in list(energy_map_display.values()):
         df_norm[c] = df_norm[c] / df_norm["types_count"]
 
     grp_norm = (
-        df_norm.groupby("Governorate", dropna=False)[type_cols]
+        df_norm.groupby("Governorate", dropna=False)[list(energy_map_display.values())]
         .sum()
         .reset_index()
         .rename(columns={
@@ -183,25 +184,23 @@ else:
         value_name="count"
     )
 
-# ---------- %-aware sorting ----------
+# sorting
 if sort_by == "Alphabetical":
     sort_order = sorted(grp_counts["Governorate"].fillna("Unknown").tolist())
 elif sort_by == "Total adopting towns":
     sort_order = grp_counts.sort_values("Total adopting towns", ascending=False)["Governorate"].tolist()
 else:
-    metric_col = sort_by  # "Solar", "Wind", "Hydro", or "Other"
+    metric_col = sort_by
     if normalize:
-        # Use % values for that energy type in the normalized tall table
         pct_table = tall[tall["Energy type"] == metric_col][["Governorate", "pct"]].copy()
         pct_table["pct"] = pct_table["pct"].fillna(0)
         sort_order = pct_table.sort_values("pct", ascending=False)["Governorate"].tolist()
     else:
-        # Use raw counts for that energy type
         cnt_table = tall[tall["Energy type"] == metric_col][["Governorate", "count"]].copy()
         cnt_table["count"] = cnt_table["count"].fillna(0)
         sort_order = cnt_table.sort_values("count", ascending=False)["Governorate"].tolist()
 
-# Chart
+# chart
 if normalize:
     y = alt.Y("pct:Q", axis=alt.Axis(format="%"), title="Share of adopting towns")
     tooltip = [
@@ -224,83 +223,45 @@ chart2 = (
     )
     .properties(height=460)
 )
-
 st.altair_chart(chart2, use_container_width=True)
 
 st.divider()
 
 # ======================================================
-# VISUAL 4 — Town-level Alternative Energy Profile (Interactive)
+# VISUAL 3 — Alternative Energy Adoption vs. Power Grid State
 # ======================================================
-st.markdown("### 4) Town Alternative Energy Profile")
+st.markdown("### 3) Alternative Energy Adoption vs. Power Grid State")
 
-energy_map_simple = {
-    "Solar": COLS["solar"],
-    "Wind":  COLS["wind"],
-    "Hydro": COLS["hydro"],
-    "Other": COLS["other"],
+adopt_flag = (df_any["types_count"] > 0).astype(int)
+
+grid_map = {
+    "good": COLS["grid_good"],
+    "acceptable": COLS["grid_ok"],
+    "bad": COLS["grid_bad"],
 }
-towns = sorted(df[COLS["town"]].dropna().unique().tolist())
 
-c1, c2, c3 = st.columns([2, 2, 2])
-with c1:
-    selected_town = st.selectbox("Choose a town", options=towns)
-with c2:
-    compare_town = st.selectbox("Compare with (optional)", options=["(None)"] + towns, index=0)
-with c3:
-    types_chosen = st.multiselect(
-        "Energy types to display",
-        options=list(energy_map_simple.keys()),
-        default=list(energy_map_simple.keys()),
-    )
+rows = []
+for label, col in grid_map.items():
+    denom = int((df[col] == 1).sum())
+    numer = int(((df[col] == 1) & (adopt_flag == 1)).sum())
+    rate = (numer / denom) if denom else 0.0
+    rows.append({"Power Grid State": label, "Adoption Rate": rate, "Towns in state": denom, "Adopting towns": numer})
 
-def build_town_profile(frame, town_name, label):
-    row = frame[frame[COLS["town"]] == town_name].head(1)
-    if row.empty:
-        return pd.DataFrame(columns=["Town", "Type", "Present"])
-    records = []
-    for t_label, colname in energy_map_simple.items():
-        present = int(row[colname].iloc[0])
-        records.append({"Town": label, "Type": t_label, "Present": present})
-    return pd.DataFrame(records)
+v3 = pd.DataFrame(rows)
+v3["Power Grid State"] = pd.Categorical(v3["Power Grid State"], ["good", "acceptable", "bad"], ordered=True)
 
-profile_main = build_town_profile(df, selected_town, selected_town)
-if compare_town != "(None)":
-    profile_cmp = build_town_profile(df, compare_town, compare_town)
-    prof_all = pd.concat([profile_main, profile_cmp], ignore_index=True)
-else:
-    prof_all = profile_main.copy()
-
-if types_chosen:
-    prof_all = prof_all[prof_all["Type"].isin(types_chosen)]
-else:
-    st.info("Select at least one energy type to display.")
-    prof_all = prof_all.iloc[0:0]
-
-chart4 = (
-    alt.Chart(prof_all)
+chart3 = (
+    alt.Chart(v3)
     .mark_bar()
     .encode(
-        x=alt.X("Type:N", title="Energy Type"),
-        y=alt.Y("Present:Q", title="Presence (0/1)", scale=alt.Scale(domain=[0, 1])),
-        column=alt.Column("Town:N", title=None),
-        color=alt.Color("Type:N", legend=None),
-        tooltip=["Town:N", "Type:N", "Present:Q"],
+        x=alt.X("Power Grid State:N", sort=["good", "acceptable", "bad"], title="Power Grid State"),
+        y=alt.Y("Adoption Rate:Q", axis=alt.Axis(format="%"), title="Adoption Rate"),
+        tooltip=["Power Grid State:N",
+                 alt.Tooltip("Adoption Rate:Q", format=".1%"),
+                 "Adopting towns:Q", "Towns in state:Q"],
     )
-    .properties(height=300)
+    .properties(height=360)
 )
-st.altair_chart(chart4, use_container_width=True)
+st.altair_chart(chart3, use_container_width=True)
 
-with st.expander("Summary"):
-    if not prof_all.empty:
-        by_town = (
-            prof_all.groupby(["Town"])["Present"]
-            .sum()
-            .reset_index()
-            .rename(columns={"Present": "Number of energy types present"})
-        )
-        st.dataframe(by_town, use_container_width=True)
-    else:
-        st.write("No types selected.")
-
-st.caption("Tip: Use the sidebar to upload a new CSV anytime. Town names are auto-cleaned from links.")
+st.caption("Reads data from 325 data.csv in this folder. Town names are auto-cleaned from links.")
