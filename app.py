@@ -29,7 +29,6 @@ def coerce_percent(s: pd.Series) -> pd.Series:
     """
     if pd.api.types.is_numeric_dtype(s):
         s = s.astype(float)
-        # if majority are 0..1, scale to percent
         if s.dropna().between(0, 1).mean() > 0.5:
             return s * 100.0
         return s
@@ -114,28 +113,36 @@ if not ENERGY_COLS:
     st.error("No energy-type columns found.")
     st.stop()
 
-# ---------------- Adoption % (real range if present; else fallback 0/100) ----------------
-# Try to find a numeric adoption column
-ADOPTION_CANDIDATES = [
-    "adoption_rate", "adoption_pct", "adoption percent", "alt_energy_adoption",
-    "alternative energy adoption", "adoption"
-]
-adopt_col = next((c for c in df.columns if c.lower() in ADOPTION_CANDIDATES), None)
+# ---------------- Adoption % (detect real column; else fallback) ----------------
+# 1) heuristic candidates by name
+name_hits = [c for c in df.columns if ("adopt" in c.lower()) or c.strip().endswith("%")]
+# 2) numeric-in-range candidates (0..100 with at least 3 unique values)
+range_hits = [c for c in df.columns
+              if pd.api.types.is_numeric_dtype(df[c])
+              and df[c].dropna().between(0, 100).mean() > 0.95
+              and df[c].nunique(dropna=True) >= 3]
 
-if adopt_col is not None:
-    df["_adoption_pct"] = coerce_percent(df[adopt_col]).clip(lower=0, upper=100)
+candidates = list(dict.fromkeys(name_hits + range_hits))  # stable de-dup, name hits first
+options = ["<Use existence flags (0/100)>"] + candidates
+
+with st.sidebar:
+    st.header("🔎 Filters")
+    adopt_choice = st.selectbox("Adoption column", options=options, index=0,
+                                help="Choose your numeric adoption column if you have one.")
+
+# compute adoption_pct
+if adopt_choice != "<Use existence flags (0/100)>":
+    df["_adoption_pct"] = coerce_percent(df[adopt_choice]).clip(lower=0, upper=100)
 else:
-    # fallback from exists/does-not-exist flags
     if (COL_EXISTS_YES in df.columns) and (COL_EXISTS_NO in df.columns):
         exists_yes = coerce_bool(df[COL_EXISTS_YES])
         exists_no  = coerce_bool(df[COL_EXISTS_NO])
         df["_adoption_pct"] = np.where(exists_yes, 100.0, np.where(exists_no, 0.0, np.nan))
     else:
-        # if nothing available, default to NaN and warn
         df["_adoption_pct"] = np.nan
-        st.warning("No explicit adoption column found and existence flags missing; adoption filter will be disabled.")
+        st.warning("No adoption column selected and existence flags not found; adoption filter will be disabled.")
 
-# Grid & lighting labels from one-hot flags
+# Grid & lighting labels
 df["_grid_label"] = df.apply(
     lambda r: derive_onehot_label(r, {"Good": COL_GRID_GOOD, "Acceptable": COL_GRID_OK, "Bad": COL_GRID_BAD}),
     axis=1
@@ -145,12 +152,9 @@ df["_light_label"] = df.apply(
     axis=1
 )
 
-# ---------------- Sidebar filters (with search + adoption range) ----------------
+# ---------------- Sidebar (continued): gov search + adoption range + heatmap option ----------------
 govs_all = sorted(df[COL_GOV].dropna().astype(str).unique().tolist())
 with st.sidebar:
-    st.header("🔎 Filters")
-
-    # Governorate search + multiselect
     gov_search = st.text_input("Search governorate", placeholder="type to filter…").strip().lower()
     if gov_search:
         gov_options = [g for g in govs_all if gov_search in g.lower()]
@@ -163,17 +167,16 @@ with st.sidebar:
     if not sel_govs:
         sel_govs = gov_options
 
-    # Adoption range slider (dynamic to your data; max out to 100 if data smaller)
+    # Dynamic adoption range (uses actual min/max of selected column)
     if df["_adoption_pct"].notna().any():
         data_min = float(np.nanmin(df["_adoption_pct"]))
         data_max = float(np.nanmax(df["_adoption_pct"]))
-        slider_max = max(100.0, round(data_max + 0.5, 1))  # keep headroom
+        slider_max = max(100.0, round(data_max + 0.5, 1))
         adopt_range = st.slider(
             "Adoption rate filter (%)",
             min_value=0.0, max_value=slider_max,
             value=(0.0, min(slider_max, round(data_max, 1))),
-            step=0.5,
-            help="Only include towns whose adoption falls in this range."
+            step=0.5
         )
     else:
         adopt_range = (0.0, 100.0)
@@ -183,18 +186,18 @@ with st.sidebar:
     st.subheader("🔥 Visual 4 Options")
     norm_axis = st.radio("Normalize heatmap by", ["None", "Grid state", "Lighting state"], horizontal=True)
 
-# Build mask
+# Filter
 mask_gov = df[COL_GOV].astype(str).isin(sel_govs)
 if df["_adoption_pct"].notna().any():
     mask_adopt = df["_adoption_pct"].between(adopt_range[0], adopt_range[1], inclusive="both").fillna(False)
 else:
-    mask_adopt = True  # no adoption filter available
+    mask_adopt = True
 mask = mask_gov & mask_adopt
 df_filt = df.loc[mask].copy()
 
-# Show current adoption range (optional context)
 if df["_adoption_pct"].notna().any():
-    st.caption(f"Filtering towns with adoption between **{adopt_range[0]}%** and **{adopt_range[1]}%**.")
+    st.caption(f"Using **{adopt_choice if adopt_choice != '<Use existence flags (0/100)>' else 'existence flags'}**, "
+               f"showing adoption **{adopt_range[0]}–{adopt_range[1]}%**.")
 
 # Tabs
 tab2, tab4 = st.tabs(["📊 Visual 2 — Stacked Bar by Governorate", "🧯 Visual 4 — Heatmap: Grid × Lighting"])
@@ -206,8 +209,6 @@ with tab2:
     long_frames = []
     for c in ENERGY_COLS:
         flag = coerce_bool(df_filt[c])
-
-        # towns sample per gov × energy type
         towns = (
             df_filt.loc[flag, [COL_GOV, "_town_clean"]]
             .groupby(COL_GOV, dropna=False)["_town_clean"]
@@ -215,7 +216,6 @@ with tab2:
             .reset_index()
             .rename(columns={"_town_clean": "Towns (sample)"})
         )
-
         counts = (
             df_filt.assign(_flag=flag)
                   .groupby(COL_GOV, dropna=False)["_flag"]
@@ -223,7 +223,6 @@ with tab2:
                   .rename("Count")
                   .reset_index()
         )
-
         merged = counts.merge(towns, on=COL_GOV, how="left")
         merged["Energy Type"] = c.replace("Type of alternative energy used - ", "").title()
         merged["Towns (sample)"] = merged["Towns (sample)"].apply(
